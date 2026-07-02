@@ -1,0 +1,72 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# =============================================================================
+# EXAMPLE: Gerrit-sourced release caller for the build-test-release workflow
+# =============================================================================
+# Use this form when Gerrit is the source of truth (SCM) for your project.
+#
+# This is Model A: the TAG-DRIVEN release model. Unlike the verify
+# workflow (which gerrit_to_platform dispatches per patchset and votes
+# on), a RELEASE is driven by a tag. For Gerrit projects the release tag
+# is pushed to Gerrit and replicated to the GitHub mirror, where it fires
+# this standard tag-push event. There is no Gerrit change context on a
+# tag, so no votes or comments are cast — this caller is therefore
+# near-identical to the GitHub-native release caller (github.yaml), and
+# release workflows are tag-triggered ONLY (no workflow_dispatch).
+#
+# REGISTRY-NATIVE TRUSTED PUBLISHING MAY NEED TO LIVE HERE, CALLER-SIDE.
+# OIDC/trusted-publishing mechanisms (e.g. npm trusted publishing) match
+# the OIDC job_workflow_ref claim against THIS repository (the GitHub
+# mirror), so a reusable workflow cannot always act as the trusted
+# publisher. The reusable workflow exposes a `tag` output and leaves the
+# run-scoped build artefact in place, so caller-side publish jobs
+# (stacked after the `release` job below) have everything they need.
+# For Nexus publishing, prefer the built-in nexus_publish input using
+# the 1Password credential model.
+# =============================================================================
+name: 'Gerrit Release'
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      - '**'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  release:
+    name: 'Build/Test/Release'
+    # Skip tag deletion events
+    if: "!github.event.deleted"
+    permissions:
+      contents: write       # Create the GitHub release / attach assets
+      id-token: write       # OIDC for build provenance attestations
+      attestations: write   # Build provenance attestations
+    # Pin to a specific node-workflows release SHA in production
+    # instead of the mutable @main reference.
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/node-workflows/.github/workflows/build-test-release.yaml@main
+    # All inputs are optional; uncomment to tune.
+    # with:
+    #   path_prefix: '.'
+    #   node_version: ''              # override Node.js auto-detection
+    #   build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
+    #   attestations: true
+    #   sigstore_sign: true
+    #   nexus_publish: true           # publish to a Nexus npm registry
+    #   registry_url: 'https://nexus3.example.org/repository/npm.release/'
+    # Uncomment the secrets block when nexus_publish is true:
+    # secrets:
+    #   OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    #   VAULT_MAPPING_JSON: ${{ secrets.VAULT_MAPPING_JSON }}
+
+# Caller-side registry publish jobs go here, stacked after the release
+# job, consuming `needs.release.outputs.tag` and the run-scoped build
+# artefact, when a registry-native trusted-publishing flow applies.

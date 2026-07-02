@@ -1,0 +1,56 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# =============================================================================
+# EXAMPLE: Plain GitHub-native caller for the reusable build-test workflow
+# =============================================================================
+# Copy this file into your project's .github/workflows/ directory (for
+# example as build-test.yaml) and adjust the `uses:` ref and the optional
+# `with:` overrides to suit your project.
+#
+# This is the GitHub-native form: it runs on pull requests, exactly like a
+# standard GitHub project. For projects where Gerrit is the source of truth,
+# use the gerrit.yaml example in this directory instead.
+# =============================================================================
+name: 'Build/Test'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-test:
+    name: 'Build/Test'
+    permissions:
+      contents: read
+      pull-requests: read  # repository-metadata-action queries PR data
+    # Pin to a specific node-workflows release SHA in production
+    # instead of the mutable @main reference.
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/node-workflows/.github/workflows/build-test.yaml@main
+    # All inputs are optional. Uncomment and tune only what your project
+    # needs; everything else falls back to sensible defaults.
+    # with:
+    #   path_prefix: '.'              # project root (monorepo subdir, etc.)
+    #   node_version: ''              # override Node.js auto-detection
+    #   build_tool: ''                # 'npm' or 'yarn'; empty auto-detects
+    #   build_scripts: 'build'        # package.json build script(s)
+    #   test_script: 'test'           # package.json test script
+    #   test_permit_fail: false       # soft-fail tests
+    #   audit_level: 'low'            # npm audit severity gate
+    #   production_only: false        # audit production dependencies only
+    #   audit_permit_fail: false      # soft-fail dependency audit
+    #   grype_fail_on: 'medium'       # Grype severity gate
+    #   harden_runner_egress: 'block' # 'block' (default) or 'audit'
