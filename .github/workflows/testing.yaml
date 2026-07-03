@@ -1,17 +1,31 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Action test/validation workflow
-name: "Test GitHub Action 🧪"
+# Exercises the reusable build-test workflow against pinned downstream
+# Node.js fixture repositories, in parallel, to prove the pipeline
+# (job graph, metadata detection, harden-runner wiring, dual checkout,
+# build/test/audit legs, SBOM/Grype chain) functions end-to-end.
+#
+# The reusable workflow is referenced by LOCAL path so this always
+# validates the current branch's workflows.
+#
+# The build-test-release and merge workflows are NOT self-tested here:
+# build-test-release requires a signed semver tag-push context (and
+# creates/promotes GitHub releases), and merge requires a merged-commit
+# context (and would exercise Nexus credential loading and publish
+# legs); neither is available or safe on a pull request. Instantiating
+# repositories validate those through their own release/merge cycles.
+name: 'Testing 🧪'
 
 # yamllint disable-line rule:truthy
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
   pull_request:
-    branches: ["main"]
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+      - master
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -20,71 +34,44 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
-    runs-on: ubuntu-latest
+  # Node.js fixture repositories, fanned out in parallel via a matrix:
+  # a modern npm project and a legacy 2020-era ONAP project, pinned to
+  # exact commits so runs stay reproducible.
+  build-test:
+    name: 'Build/Test'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'test-node-project'
+            repository: 'lfreleng-actions/test-node-project'
+            ref: '89cc7f156c88afa1855087b00ac0dce886e7b0f3'
+            node_version: ''
+            test_permit_fail: false
+            audit_permit_fail: false
+            grype_permit_fail: false
+          - name: 'sdc-onap-ui-common'
+            repository: 'onap/sdc-onap-ui-common'
+            ref: 'c305ee4240e368dd0b2238a4f39881a97bad6746'
+            # Legacy toolchain: the repository declares no engines or
+            # .nvmrc, and its 2020-era dependency tree needs Node 16
+            node_version: '16'
+            # The legacy dependency tree fails tests on modern runners
+            test_permit_fail: true
+            # No lockfile in the repository, so this leg exercises the
+            # node-audit-action lockfile synthesis; the legacy
+            # dependency tree carries known audit findings
+            audit_permit_fail: true
+            # 2020-era dependencies trip the Grype severity gate
+            grype_permit_fail: true
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
-    steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
-        with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
-
-      # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
-        with:
-          egress-policy: 'block'
-          allowed-endpoints: >
-            ${{ env.CONNECTION_ALLOW_LIST }}
-
-      - name: "Checkout repository"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: "Running local action: ${{ github.repository }}"
-        uses: ./
-        with:
-          input: "test input 💬"
-
-      - name: "Validated local action: ${{ github.repository }}"
-        shell: bash
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
-
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
-        with:
-          invalid_input: "Some garbage"
-
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
-        shell: bash
-        run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+      pull-requests: read  # repository-metadata-action queries PR data
+    uses: ./.github/workflows/build-test.yaml
+    with:
+      repository: ${{ matrix.repository }}
+      ref: ${{ matrix.ref }}
+      node_version: ${{ matrix.node_version }}
+      test_permit_fail: ${{ matrix.test_permit_fail }}
+      audit_permit_fail: ${{ matrix.audit_permit_fail }}
+      grype_permit_fail: ${{ matrix.grype_permit_fail }}

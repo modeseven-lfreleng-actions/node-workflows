@@ -1,0 +1,1611 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Reusable Node.js build/test/release pipeline (Model A: tag-driven).
+#
+# Reproduces the canonical Linux Foundation release pipeline shape. The
+# repository-metadata job runs in parallel as an informational step;
+# node-metadata resolves the effective Node.js version and build tool.
+# After build the audit jobs in { } run in parallel; the tests then gate
+# on ALL of them (gating inversion: on releases the audits gate the
+# expensive test matrix), and publishing runs at the end:
+#   tag-validate -> build -> { audit | sbom -> grype } -> tests
+#     -> attach-artefacts -> promote-release -> nexus-publish
+# The sign-artefacts job (Sigstore keyless) runs after build when the
+# sigstore_sign input enables it; nexus-publish runs when the
+# nexus_publish input enables it.
+#
+# Call this from a thin caller workflow on a tag push; see
+# examples/build-test-release/ for both a plain GitHub-native caller and
+# a Gerrit-wrapped caller.
+name: '[R] Node.js Build/Test/Release'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_call:
+    inputs:
+      # --- Checkout target (defaults to the calling repository) ---
+      repository:
+        description: 'Repository to check out (owner/name)'
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: >-
+          Branch/tag/SHA to check out. Empty uses the triggering
+          event's ref for same-repository checkouts, or the default
+          branch when checking out a different repository.
+        required: false
+        type: string
+        default: ''
+
+      # --- Project layout ---
+      path_prefix:
+        description: 'Path to the project root directory'
+        required: false
+        type: string
+        default: '.'
+
+      # --- Node.js toolchain ---
+      node_version:
+        description: >-
+          Node.js version to use. Empty (the default) auto-detects a
+          plain engines.node version from package.json and otherwise
+          falls back to the current default (22).
+        required: false
+        type: string
+        default: ''
+      build_tool:
+        description: >-
+          Build tool: 'npm' or 'yarn'. Empty (the default) auto-detects
+          the package manager from the project lockfile/metadata and
+          otherwise falls back to npm.
+        required: false
+        type: string
+        default: ''
+
+      # --- Build ---
+      build_scripts:
+        description: 'package.json script(s) the build job runs'
+        required: false
+        type: string
+        default: 'build'
+
+      # --- Tests ---
+      test_script:
+        description: 'package.json script the tests job runs'
+        required: false
+        type: string
+        default: 'test'
+      test_permit_fail:
+        description: 'Permit test failures without failing the workflow'
+        required: false
+        type: boolean
+        default: false
+
+      # --- Audit ---
+      audit_level:
+        description: >-
+          npm audit severity threshold that fails the audit: 'info',
+          'low', 'moderate', 'high' or 'critical'
+          (matches the node-audit-action default)
+        required: false
+        type: string
+        default: 'high'
+      production_only:
+        description: 'Audit production dependencies only'
+        required: false
+        type: boolean
+        default: false
+      audit_permit_fail:
+        description: 'Permit dependency audit failures (the NO_BLOCK pattern)'
+        required: false
+        type: boolean
+        default: false
+
+      # --- Grype scan ---
+      grype_fail_on:
+        description: 'Minimum severity that fails the Grype scan'
+        required: false
+        type: string
+        default: 'medium'
+      grype_permit_fail:
+        description: >-
+          Permit Grype findings without failing the job. When false, falls
+          back to the NO_BLOCK_AUDIT_FAIL repository variable at runtime.
+        required: false
+        type: boolean
+        default: false
+
+      # --- Runner hardening ---
+      harden_runner_egress:
+        description: "Harden-runner egress policy: 'block' or 'audit'"
+        required: false
+        type: string
+        default: 'block'
+      harden_runner_allowlist:
+        description: 'Out-of-band harden-runner allow-list configuration'
+        required: false
+        type: string
+        # yamllint disable-line rule:line-length
+        default: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@807a544b7e55a9224b2b3780e636467bd4b5b99b'  # v0.5.0
+
+      # --- Gerrit-aware checkout (empty unless dispatched via Gerrit) ---
+      gerrit_refspec:
+        description: 'Gerrit refspec of the change under test'
+        required: false
+        type: string
+        default: ''
+      gerrit_project:
+        description: 'Gerrit project name'
+        required: false
+        type: string
+        default: ''
+      gerrit_branch:
+        description: 'Gerrit target branch'
+        required: false
+        type: string
+        default: ''
+      gerrit_url:
+        description: >-
+          Gerrit server URL. Empty falls back to the GERRIT_URL repository
+          variable at runtime.
+        required: false
+        type: string
+        default: ''
+
+      # --- Release-only inputs ---
+      attestations:
+        description: >-
+          Generate SLSA build provenance attestations for the packed
+          npm tarball (verifiable with `gh attestation verify`). Keep
+          it toggleable for air-gapped or Gerrit-mirrored consumers
+          that cannot reach Sigstore.
+        required: false
+        type: boolean
+        default: true
+      sigstore_sign:
+        description: >-
+          Sign the packed npm tarball with Sigstore (keyless/OIDC),
+          producing a .sigstore.json bundle attached to the GitHub
+          release (verifiable with `cosign verify-blob --bundle`). Keep
+          it toggleable for air-gapped or Gerrit-mirrored consumers
+          that cannot reach Sigstore.
+        required: false
+        type: boolean
+        default: true
+
+      # --- Nexus/registry publishing ---
+      nexus_publish:
+        description: >-
+          Publish the package to a Nexus npm registry after the GitHub
+          release promotes; requires the OP_SERVICE_ACCOUNT_TOKEN and
+          VAULT_MAPPING_JSON secrets
+        required: false
+        type: boolean
+        default: false
+      registry_url:
+        description: >-
+          npm registry URL that receives the publish, e.g.
+          https://nexus3.example.org/repository/npm.release/
+        required: false
+        type: string
+        default: ''
+      nexus_user:
+        description: >-
+          Nexus username override; empty derives the username from the
+          repository name (the 1Password credential naming contract)
+        required: false
+        type: string
+        default: ''
+      npm_tag:
+        description: 'npm dist-tag applied to the published version'
+        required: false
+        type: string
+        default: 'latest'
+      npm_access:
+        description: >-
+          npm publish access: 'public' or 'restricted'; empty keeps the
+          registry default
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Run the Nexus publish steps without uploading'
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: >-
+          1Password service-account token used by credential-load-action
+          to fetch the per-repository Nexus credential from the common
+          per-org CI/CD vault (op://<vault>/<repository-name>/password).
+          Only needed when nexus_publish is true.
+        required: false
+      VAULT_MAPPING_JSON:
+        description: >-
+          Base64-encoded JSON mapping of organisation name to 1Password
+          vault ID, keyed on github.repository_owner; consumed by
+          credential-load-action to resolve the correct vault. Only
+          needed when nexus_publish is true.
+        required: false
+
+    outputs:
+      tag:
+        description: 'Validated release tag/version string'
+        value: ${{ jobs.tag-validate.outputs.tag }}
+
+permissions: {}
+
+jobs:
+  gerrit-validate:
+    name: 'Validate Gerrit Inputs'
+    # Fails fast with a clear message when gerrit_refspec is set without
+    # the project/branch the Gerrit checkout path also requires. The
+    # build-chain root job depends on this, so invalid Gerrit inputs stop
+    # the pipeline early and cleanly. This job always runs (only the
+    # validation step is conditional), so gating dependents on it does
+    # not trip GitHub's "skipped need skips dependents" behaviour.
+    # The job carries no harden-runner step by design: it performs pure
+    # input-string validation with no checkout, artifacts or network
+    # access, and loading the egress allow-list would itself add an
+    # outbound call.
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - name: 'Validate path_prefix input'
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+        run: |
+          # Require a relative, non-traversing path: later jobs cd
+          # into it and derive packaging/publish paths from it, so
+          # absolute paths or .. segments could escape the checkout
+          if [ "${PATH_PREFIX}" = '.' ]; then
+            exit 0
+          fi
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+
+      - name: 'Require Gerrit project, branch and URL'
+        if: inputs.gerrit_refspec != ''
+        shell: bash
+        env:
+          GERRIT_PROJECT: ${{ inputs.gerrit_project }}
+          GERRIT_BRANCH: ${{ inputs.gerrit_branch }}
+          # yamllint disable-line rule:line-length
+          GERRIT_URL: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+        run: |
+          # gerrit_refspec is set, so the Gerrit checkout path runs and
+          # also requires gerrit_project, gerrit_branch and a resolvable
+          # Gerrit URL (the gerrit_url input or the GERRIT_URL variable).
+          missing=''
+          if [ -z "${GERRIT_PROJECT}" ]; then
+            missing="${missing} gerrit_project"
+          fi
+          if [ -z "${GERRIT_BRANCH}" ]; then
+            missing="${missing} gerrit_branch"
+          fi
+          if [ -z "${GERRIT_URL}" ]; then
+            missing="${missing} gerrit_url/GERRIT_URL"
+          fi
+          if [ -n "${missing}" ]; then
+            echo "::error::gerrit_refspec is set but missing:${missing}"
+            exit 1
+          fi
+          echo "Gerrit inputs validated ✅"
+
+  repository-metadata:
+    name: 'Repository Metadata'
+    needs: gerrit-validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Gather repository metadata'
+        id: repo-metadata
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/repository-metadata-action@ceabcd987d13d7bfefd2372e01eebb0ddac45956  # v0.2.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_summary: 'true'
+          gerrit_summary: ${{ inputs.gerrit_refspec != '' }}
+          artifact_upload: 'true'
+          artifact_formats: 'json'
+
+  node-metadata:
+    name: 'Node.js Metadata'
+    needs: gerrit-validate
+    runs-on: ubuntu-latest
+    outputs:
+      node_version: ${{ steps.resolve.outputs.node_version }}
+      build_tool: ${{ steps.resolve.outputs.build_tool }}
+      # yamllint disable-line rule:line-length
+      has_lock_file: ${{ steps.build-metadata.outputs.javascript_has_lock_file }}
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: 'Gather Node.js build metadata'
+        id: build-metadata
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-metadata-action@ed0cc5bcf3a7ddd4e40058c46fc4211eb71b7f86  # v0.5.0
+        with:
+          path_prefix: ${{ inputs.path_prefix }}
+          artifact_upload: 'false'
+
+      - name: 'Resolve Node.js version and build tool'
+        id: resolve
+        shell: bash
+        env:
+          NODE_VERSION_INPUT: ${{ inputs.node_version }}
+          BUILD_TOOL_INPUT: ${{ inputs.build_tool }}
+          # yamllint disable-line rule:line-length
+          DETECTED_PACKAGE_MANAGER: ${{ steps.build-metadata.outputs.javascript_package_manager }}
+          # yamllint disable-line rule:line-length
+          DETECTED_REQUIRES_NODE: ${{ steps.build-metadata.outputs.javascript_requires_node }}
+        run: |
+          # Resolve the effective Node.js version and build tool:
+          # explicit inputs win, then metadata detection, then defaults
+          node_version="${NODE_VERSION_INPUT}"
+          # Constrain caller input to the character set the downstream
+          # setup/audit/publish actions accept, and keep the value safe
+          # to write to $GITHUB_OUTPUT
+          if [ -n "${node_version}" ] &&
+            [[ ! "${node_version}" =~ ^[A-Za-z0-9./*_-]+$ ]]; then
+            echo "::error::Invalid node_version input: ${node_version}"
+            exit 1
+          fi
+          if [ -z "${node_version}" ]; then
+            # Use the engines.node constraint when it names a plain
+            # version; downstream actions reject range syntax (>=18)
+            if [[ "${DETECTED_REQUIRES_NODE}" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]
+            then
+              node_version="${DETECTED_REQUIRES_NODE}"
+            elif [ -n "${DETECTED_REQUIRES_NODE}" ]; then
+              echo "::notice::engines.node constraint" \
+                "'${DETECTED_REQUIRES_NODE}' is not a plain version;" \
+                "using the default Node.js version"
+            fi
+          fi
+          if [ -z "${node_version}" ]; then
+            node_version='22'
+          fi
+          build_tool="${BUILD_TOOL_INPUT}"
+          case "${build_tool}" in
+            npm|yarn) ;;
+            '')
+              case "${DETECTED_PACKAGE_MANAGER}" in
+                npm|yarn)
+                  build_tool="${DETECTED_PACKAGE_MANAGER}"
+                  ;;
+                '')
+                  build_tool='npm'
+                  ;;
+                *)
+                  echo "::notice::Detected package manager" \
+                    "'${DETECTED_PACKAGE_MANAGER}' lacks" \
+                    "node-build-action support; using npm"
+                  build_tool='npm'
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::Invalid build_tool input: ${build_tool}" \
+                "(must be 'npm' or 'yarn')"
+              exit 1
+              ;;
+          esac
+          echo "Resolved Node.js version: ${node_version}"
+          echo "Resolved build tool: ${build_tool}"
+          echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
+          echo "build_tool=${build_tool}" >> "$GITHUB_OUTPUT"
+
+  tag-validate:
+    name: 'Validate Tag Push'
+    needs: gerrit-validate
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: write  # Needed to draft a release
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag-validate.outputs.tag_name }}
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: 'Verify pushed tag'
+        id: 'tag-validate'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/tag-validate-action@bc8043ec074495cc8cdf351623ebab3675d563cf  # v1.0.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          require_type: 'semver'
+          reject_development: 'true'
+          require_github: 'true'
+          # yamllint disable-line rule:line-length
+          require_signed: 'ssh,gpg-unverifiable'  # Cannot verify GPG without key
+
+      - name: 'Ensure draft release exists'
+        id: 'ensure-release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag-validate.outputs.tag_name }}
+        run: |
+          # Ensure draft release exists
+          # Check if release exists and get its draft status
+          if RELEASE_INFO=$(gh release view "$TAG" \
+            --json isDraft 2>/dev/null); then
+            IS_DRAFT=$(echo "$RELEASE_INFO" | jq -r '.isDraft')
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "Draft release for tag $TAG already exists"
+            else
+              echo "::error::A published release already exists for $TAG;" \
+                "delete or recreate it as a draft, then re-run."
+              exit 1
+            fi
+          else
+            echo "Creating draft release for tag $TAG"
+            gh release create "$TAG" \
+              --draft \
+              --title "Release $TAG" \
+              --notes "Automated release for $TAG"
+          fi
+
+  build:
+    name: 'Build'
+    needs:
+      - 'tag-validate'
+      - 'node-metadata'
+    runs-on: 'ubuntu-latest'
+    outputs:
+      artefact_name: ${{ steps.build.outputs.artefact_name }}
+      artefact_path: ${{ steps.build.outputs.artefact_path }}
+      tarball_name: ${{ steps.build.outputs.tarball_name }}
+    permissions:
+      contents: read
+    timeout-minutes: 12
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Explicit toolchain setup so the stamp/pack steps run on the
+      # resolved Node.js version rather than whatever the runner image
+      # happens to carry
+      - name: 'Set up Node.js'
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ needs.node-metadata.outputs.node_version }}
+
+      # Stamp package.json BEFORE the build so build outputs that
+      # embed the package version (banners, generated metadata) match
+      # the version the tarball ships with
+      - name: 'Stamp release version'
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          TAG: ${{ needs.tag-validate.outputs.tag }}
+        run: |
+          # Constrain path_prefix to a relative, non-traversing path
+          # before cd (rejects absolute paths and .. segments)
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          # Stamp package.json with the validated tag version;
+          # --ignore-scripts keeps project lifecycle scripts
+          # (preversion/version/postversion) from running before
+          # dependencies install
+          cd "${PATH_PREFIX}"
+          version="${TAG#v}"
+          npm version --no-git-tag-version --allow-same-version \
+            --ignore-scripts "${version}"
+
+      - name: 'Build project'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/node-build-action@240bf4111c4ae035762a4ededde2a3c2d17237be  # v0.2.2
+        with:
+          node_version: ${{ needs.node-metadata.outputs.node_version }}
+          build_tool: ${{ needs.node-metadata.outputs.build_tool }}
+          path_prefix: ${{ inputs.path_prefix }}
+          scripts: ${{ inputs.build_scripts }}
+
+      - name: 'Pack release tarball'
+        id: build
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+        run: |
+          # Constrain path_prefix to a relative, non-traversing,
+          # single-line path before it reaches $GITHUB_OUTPUT
+          # (output-file injection) or drives packaging paths
+          if [[ ! "${PATH_PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "${PATH_PREFIX}" =~ (^|/)\.\.(/|$) ]]; then
+            echo "::error::Invalid path_prefix input: ${PATH_PREFIX}"
+            exit 1
+          fi
+          # Produce the release tarball via npm pack (package.json
+          # already carries the stamped release version)
+          cd "${PATH_PREFIX}"
+          mkdir -p pack-dist
+          tarball=$(npm pack --pack-destination pack-dist | tail -n1)
+          if [ ! -f "pack-dist/${tarball}" ]; then
+            echo "::error::npm pack produced no tarball"
+            exit 1
+          fi
+          echo "Packed release tarball: ${tarball}"
+          {
+            echo "artefact_name=node-release-package"
+            echo "artefact_path=${PATH_PREFIX}/pack-dist"
+            echo "tarball_name=${tarball}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Upload build artefact'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.build.outputs.artefact_name }}
+          path: ${{ steps.build.outputs.artefact_path }}
+          if-no-files-found: error
+
+  audit:
+    name: 'Audit'
+    runs-on: ubuntu-latest
+    needs:
+      - 'node-metadata'
+      - 'build'
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # node-audit-action synthesizes a lockfile when the project
+      # lacks one, so legacy projects still get audit coverage
+      - name: 'Audit dependencies'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/node-audit-action@bfd96d8e38bf62d8764737fbefbf74f945377afc  # v0.0.1
+        with:
+          path_prefix: ${{ inputs.path_prefix }}
+          node_version: ${{ needs.node-metadata.outputs.node_version }}
+          audit_level: ${{ inputs.audit_level }}
+          production_only: ${{ inputs.production_only }}
+          # The NO_BLOCK/soft-fail pattern: setting the
+          # audit_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
+          # repository variable (an org/repo-wide override that
+          # soft-fails these checks even when the caller passes
+          # false), disables failure propagation.
+          # yamllint disable-line rule:line-length
+          permit_fail: ${{ inputs.audit_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
+
+  sbom:
+    name: 'Generate SBOM'
+    runs-on: ubuntu-latest
+    needs: 'build'
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Emits sbom-cyclonedx.json at the workspace root (the Grype
+      # job contract)
+      - name: 'Generate SBOM'
+        id: sbom
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/sbom-action@df0b04bb49f19c0dca5e6e08a0c9080bf55d261e  # v0.0.1
+        with:
+          path_prefix: ${{ inputs.path_prefix }}
+          filename_prefix: 'sbom-cyclonedx'
+          output_directory: '.'
+          include_dev: 'false'
+
+      - name: 'Upload SBOM artifacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sbom-files
+          # Glob matches whichever SBOM formats the generator produced
+          path: sbom-cyclonedx.*
+          retention-days: 45
+          # Fail fast: the downstream Grype job requires this artifact,
+          # so a missing/misnamed SBOM must surface here, not later
+          if-no-files-found: error
+
+      - name: 'SBOM summary'
+        shell: bash
+        env:
+          COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
+        run: |
+          # SBOM summary
+          {
+            echo "## SBOM Summary"
+            echo "CycloneDX SBOM with ${COMPONENT_COUNT} components"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  grype:
+    name: 'Grype Audit SBOM'
+    runs-on: ubuntu-latest
+    needs: 'sbom'
+    if: ${{ !cancelled() && needs.sbom.result == 'success' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Download SBOM artefact'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: sbom-files
+
+      - name: 'Install Grype'
+        id: grype
+        # yamllint disable-line rule:line-length
+        uses: anchore/scan-action/download-grype@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2  # v7.4.0
+        with:
+          cache-db: 'true'
+
+      # Setting the grype_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
+      # repository variable (an org/repo-wide override that soft-fails
+      # this check even when the caller passes false), disables failure
+      # propagation so pull requests
+      # can proceed when blocked by newly discovered CVEs in transitive
+      # dependencies.
+      - name: 'Grype audit SBOM'
+        id: grype-audit
+        env:
+          GRYPE_CMD: ${{ steps.grype.outputs.cmd }}
+          GRYPE_FAIL_ON: ${{ inputs.grype_fail_on }}
+          # yamllint disable-line rule:line-length
+          NO_BLOCK_AUDIT_FAIL: ${{ inputs.grype_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
+        shell: bash
+        run: |
+          # The audit scans the JSON CycloneDX SBOM, which the sbom step
+          # always generates. Guard anyway so the step still emits a
+          # summary (and honours grype_permit_fail) if it is missing.
+          if [ ! -f sbom-cyclonedx.json ]; then
+            echo "::warning::No JSON SBOM found; Grype scan skipped"
+            {
+              echo "## Grype Vulnerability Scan"
+              echo ""
+              echo "No JSON SBOM available to scan."
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "${NO_BLOCK_AUDIT_FAIL}" = "true" ]; then
+              exit 0
+            fi
+            echo "::error::No JSON SBOM available for the Grype audit"
+            exit 1
+          fi
+
+          # Run grype once, emitting all three output formats
+          set +e
+          "${GRYPE_CMD}" \
+            -o "sarif=grype-results.sarif" \
+            -o "json=grype-results.json" \
+            -o "table=grype-results.txt" \
+            --fail-on "${GRYPE_FAIL_ON}" \
+            "sbom:sbom-cyclonedx.json"
+          grype_exit=$?
+          set -e
+
+          echo "--- Grype scan results ---"
+          if [ -f grype-results.txt ]; then
+            cat grype-results.txt
+          else
+            echo "No table output produced"
+          fi
+
+          # grype returns 2 when it finds vulnerabilities at or above the
+          # configured --fail-on threshold; any other non-zero exit is
+          # treated as a grype failure.
+          if [ "${grype_exit}" = "0" ]; then
+            echo "No vulnerabilities at or above '${GRYPE_FAIL_ON}'"
+            exit 0
+          fi
+          if [ "${grype_exit}" != "2" ]; then
+            echo "::error::Grype exited with code ${grype_exit}"
+            exit "${grype_exit}"
+          fi
+
+          if [ "${NO_BLOCK_AUDIT_FAIL}" = "true" ]; then
+            echo "::warning::Grype found vulnerabilities at or above the" \
+              "'${GRYPE_FAIL_ON}' threshold, but failures are permitted" \
+              "so the job will not fail."
+            exit 0
+          fi
+          echo "::error::Grype found vulnerabilities at or above the" \
+            "'${GRYPE_FAIL_ON}' severity threshold. See the table above" \
+            "for the offending packages and CVEs."
+          exit 1
+
+      - name: 'Upload Grype scan results'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: grype-scan-results
+          path: |
+            grype-results.sarif
+            grype-results.json
+            grype-results.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: 'Grype summary'
+        if: always()
+        shell: bash
+        run: |
+          # Render a Markdown summary of the Grype findings
+          {
+            echo "## Grype Vulnerability Scan"
+            echo ""
+            if [ ! -f grype-results.json ]; then
+              echo "No scan results available"
+              exit 0
+            fi
+            match_count=$(jq '.matches | length' grype-results.json)
+            if [ "${match_count}" = "0" ]; then
+              echo "No vulnerabilities found at or above the configured" \
+                "severity threshold."
+              exit 0
+            fi
+            echo "Found ${match_count} matching Grype record(s)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: 'Tests'
+    runs-on: 'ubuntu-latest'
+    # Deferred until the audit operations (audit and Grype) pass, so
+    # the expensive test suite is skipped when either audit step fails
+    # (gating inversion: audits gate tests on releases).
+    needs:
+      - 'node-metadata'
+      - 'build'
+      - 'audit'
+      - 'grype'
+    # yamllint disable-line rule:line-length
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.audit.result == 'success' && needs.grype.result == 'success' }}
+    permissions:
+      contents: read
+    timeout-minutes: 12
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: 'Set up Node.js'
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ needs.node-metadata.outputs.node_version }}
+
+      - name: 'Run tests'
+        shell: bash
+        env:
+          BUILD_TOOL: ${{ needs.node-metadata.outputs.build_tool }}
+          TEST_SCRIPT: ${{ inputs.test_script }}
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          # The NO_BLOCK/soft-fail pattern: setting the
+          # test_permit_fail input, or the NO_BLOCK_AUDIT_FAIL
+          # repository variable (an org/repo-wide override that
+          # soft-fails these checks even when the caller passes
+          # false), disables failure propagation.
+          # yamllint disable-line rule:line-length
+          NO_BLOCK: ${{ inputs.test_permit_fail || vars.NO_BLOCK_AUDIT_FAIL == 'true' }}
+        run: |
+          # Install dependencies and run the configured test script
+          cd "${PATH_PREFIX}"
+          status=0
+          if [ "${BUILD_TOOL}" = 'yarn' ]; then
+            # setup-node does not guarantee a yarn binary; enable it
+            # through Corepack when missing
+            if ! command -v yarn >/dev/null 2>&1; then
+              corepack enable yarn 2>/dev/null || {
+                echo "::error::yarn unavailable and Corepack could" \
+                  "not provide it"
+                exit 1
+              }
+            fi
+            if [ -f yarn.lock ]; then
+              yarn install --frozen-lockfile || status=$?
+            else
+              yarn install || status=$?
+            fi
+            if [ "${status}" = '0' ]; then
+              # Classic yarn lacks --if-present; probe package.json
+              has_script=$(node -e "const s = \
+                require('./package.json').scripts || {}; \
+                process.stdout.write(s[process.env.TEST_SCRIPT] \
+                ? 'true' : 'false')")
+              if [ "${has_script}" = 'true' ]; then
+                yarn run "${TEST_SCRIPT}" || status=$?
+              else
+                echo "::notice::No '${TEST_SCRIPT}' script in" \
+                  "package.json; nothing to run"
+              fi
+            fi
+          else
+            if [ -f package-lock.json ] || \
+              [ -f npm-shrinkwrap.json ]; then
+              npm ci || npm install || status=$?
+            else
+              npm install || status=$?
+            fi
+            if [ "${status}" = '0' ]; then
+              npm run "${TEST_SCRIPT}" --if-present || status=$?
+            fi
+          fi
+          if [ "${status}" != "0" ]; then
+            if [ "${NO_BLOCK}" = "true" ]; then
+              echo "::warning::Tests failed, but failures are" \
+                "permitted so the job will not fail."
+              exit 0
+            fi
+            exit "${status}"
+          fi
+
+  attest:
+    name: 'Attest Build Provenance'
+    runs-on: 'ubuntu-latest'
+    needs: 'build'
+    # A dedicated job so id-token/attestations grants stay scoped to
+    # attestation work and never apply when the toggle is off
+    # yamllint disable-line rule:line-length
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.attestations }}
+    permissions:
+      contents: read
+      id-token: write       # Needed for attestations
+      attestations: write   # Needed for attestations
+    timeout-minutes: 5
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: '⬇ Download build artefacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artefact_name }}
+          path: 'attest'
+
+      # SLSA build provenance for the packed tarball; consumers verify
+      # with `gh attestation verify <tarball> --repo <owner/repo>`
+      - name: 'Attest build provenance'
+        # yamllint disable-line rule:line-length
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4.1.0
+        with:
+          subject-path: attest/${{ needs.build.outputs.tarball_name }}
+
+  sign-artefacts:
+    name: 'Sign Artefacts'
+    runs-on: 'ubuntu-latest'
+    needs: 'build'
+    # yamllint disable-line rule:line-length
+    if: ${{ !cancelled() && inputs.sigstore_sign && needs.build.result == 'success' }}
+    permissions:
+      contents: read
+      id-token: write  # Sigstore keyless/OIDC signing
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: '⬇ Download build artefacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artefact_name }}
+          path: 'signing'
+
+      - name: 'Install cosign'
+        # yamllint disable-line rule:line-length
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad  # v4.0.0
+
+      # Keyless signing against the public Sigstore infrastructure;
+      # consumers verify with `cosign verify-blob --bundle`
+      - name: 'Sign tarball with Sigstore'
+        shell: bash
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball_name }}
+        run: |
+          # Sign the release tarball (keyless), emitting a bundle
+          cd signing
+          cosign sign-blob --yes \
+            --bundle "${TARBALL}.sigstore.json" \
+            "${TARBALL}"
+
+      - name: 'Upload Sigstore bundle'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: 'sigstore-bundle'
+          path: 'signing/*.sigstore.json'
+          retention-days: 45
+          if-no-files-found: error
+
+  attach-artefacts:
+    name: 'Attach Artefacts to Release'
+    runs-on: 'ubuntu-latest'
+    needs:
+      - 'tag-validate'
+      - 'build'
+      - 'tests'
+      - 'attest'
+      - 'sign-artefacts'
+    # attest/sign-artefacts skip when their toggles are off; tolerate that
+    # yamllint disable-line rule:line-length
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.attest.result == 'success' || needs.attest.result == 'skipped') && (needs.sign-artefacts.result == 'success' || needs.sign-artefacts.result == 'skipped') }}
+    permissions:
+      contents: write  # IMPORTANT: needed to edit release, attach artefacts
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: '⬇ Download build artefacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artefact_name }}
+          path: ${{ needs.build.outputs.artefact_path }}
+
+      - name: '⬇ Download Sigstore bundle'
+        if: inputs.sigstore_sign
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: 'sigstore-bundle'
+          path: ${{ needs.build.outputs.artefact_path }}
+
+      - name: '⬇ Download SBOM artifacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: 'sbom-files'
+          path: ${{ needs.build.outputs.artefact_path }}
+
+      - name: 'Attach build artefacts to release'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/release-assets-action@985ecd2ba521dde165514af406dd114d3db5dab6  # v0.1.0
+        with:
+          asset_paths: '["${{ needs.build.outputs.artefact_path }}/**"]'
+          release_tag: ${{ needs.tag-validate.outputs.tag }}
+
+  promote-release:
+    name: 'Promote Draft Release'
+    needs:
+      - 'tag-validate'
+      - 'attach-artefacts'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: write  # IMPORTANT: needed for draft release promotion
+    timeout-minutes: 2
+    outputs:
+      # yamllint disable-line rule:line-length
+      release_url: ${{ steps.promote-release.outputs.release_url || steps.set-promoted-url.outputs.release_url }}
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: 'Check if release is already promoted'
+        id: 'check-promoted'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag-validate.outputs.tag }}
+        run: |
+          # Check if release is already promoted
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' \
+              2>/dev/null | grep -q "false"; then
+            echo "Release $TAG is already promoted, skipping promotion"
+            echo "already_promoted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG is draft or doesn't exist, " \
+                 "proceeding with promotion"
+            echo "already_promoted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 'Promote draft release'
+        id: 'promote-release'
+        if: steps.check-promoted.outputs.already_promoted == 'false'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/draft-release-promote-action@072990900b99030363d81d4131c2bf2855f07df0  # v0.1.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.tag-validate.outputs.tag }}
+          latest: true
+
+      - name: 'Set release URL for already promoted release'
+        id: 'set-promoted-url'
+        if: steps.check-promoted.outputs.already_promoted == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag-validate.outputs.tag }}
+        run: |
+          # Set release URL for already promoted release
+          RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+
+  nexus-publish:
+    name: 'Publish to Nexus'
+    runs-on: ubuntu-latest
+    needs:
+      - 'tag-validate'
+      - 'node-metadata'
+      - 'build'
+      - 'promote-release'
+    # yamllint disable-line rule:line-length
+    if: ${{ !cancelled() && inputs.nexus_publish && needs.promote-release.result == 'success' }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Load egress allow-list (block mode)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+        with:
+          config: ${{ inputs.harden_runner_allowlist }}
+      - name: 'Harden runner (block)'
+        if: inputs.harden_runner_egress != 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Harden runner (audit)'
+        if: inputs.harden_runner_egress == 'audit'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout Gerrit change'
+        if: inputs.gerrit_refspec != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/checkout-gerrit-change-action@8523d768952d9690702b4696a8310d2a84b1be39  # v1.0.1
+        with:
+          gerrit-refspec: ${{ inputs.gerrit_refspec }}
+          gerrit-project: ${{ inputs.gerrit_project }}
+          # yamllint disable-line rule:line-length
+          gerrit-url: ${{ inputs.gerrit_url != '' && inputs.gerrit_url || vars.GERRIT_URL }}
+          delay: '0s'
+          ref: refs/heads/${{ inputs.gerrit_branch }}
+      - name: 'Checkout repository'
+        if: inputs.gerrit_refspec == ''
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: '⬇ Download build artefacts'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artefact_name }}
+          path: ${{ needs.build.outputs.artefact_path }}
+
+      - name: 'Resolve publish parameters'
+        id: publish-params
+        shell: bash
+        env:
+          TAG: ${{ needs.tag-validate.outputs.tag }}
+          NEXUS_USER_INPUT: ${{ inputs.nexus_user }}
+          REGISTRY_URL: ${{ inputs.registry_url }}
+          # The repository actually checked out/published, which can
+          # differ from GITHUB_REPOSITORY for cross-repository calls
+          TARGET_REPOSITORY: ${{ inputs.repository || github.repository }}
+          # Presence flags only: expressions evaluate to 'true'/'false'
+          # so no secret material enters the environment
+          # yamllint disable-line rule:line-length
+          HAS_OP_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN != '' }}
+          HAS_VAULT_MAPPING: ${{ secrets.VAULT_MAPPING_JSON != '' }}
+        run: |
+          # Derive the publish version and Nexus username
+          if [ -z "${REGISTRY_URL}" ]; then
+            echo "::error::nexus_publish requires the registry_url" \
+              "input"
+            exit 1
+          fi
+          # Fail fast with an actionable message when the credential
+          # secrets are missing, rather than deep inside
+          # credential-load-action
+          missing=''
+          if [ "${HAS_OP_TOKEN}" != "true" ]; then
+            missing="${missing} OP_SERVICE_ACCOUNT_TOKEN"
+          fi
+          if [ "${HAS_VAULT_MAPPING}" != "true" ]; then
+            missing="${missing} VAULT_MAPPING_JSON"
+          fi
+          if [ -n "${missing}" ]; then
+            echo "::error::nexus_publish requires these workflow" \
+              "secrets:${missing}"
+            exit 1
+          fi
+          version="${TAG#v}"
+          # node-publish-action enforces strict
+          # MAJOR.MINOR.PATCH[-suffix]; validate early for a clearer
+          # failure message
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          then
+            echo "::error::Tag ${TAG} does not map to a strict" \
+              "MAJOR.MINOR.PATCH[-suffix] version"
+            exit 1
+          fi
+          nexus_user="${NEXUS_USER_INPUT}"
+          if [ -z "${nexus_user}" ]; then
+            # 1Password credential naming contract: the credential
+            # (and username) take the name of the repository being
+            # published (the checked-out repository, not necessarily
+            # the caller)
+            nexus_user="${TARGET_REPOSITORY##*/}"
+          fi
+          # Constrain to a safe single-line character set before the
+          # value reaches $GITHUB_OUTPUT (output-file injection)
+          if [[ ! "${nexus_user}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid nexus_user value: ${nexus_user}"
+            exit 1
+          fi
+          echo "publish_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "nexus_user=${nexus_user}" >> "$GITHUB_OUTPUT"
+
+      # credential_grants_json wires the admin-managed
+      # CREDENTIAL_LOAD_GRANTS repository/organisation variable in at
+      # the workflow layer: composite actions cannot read vars, and the
+      # grants list must never become a caller-facing input
+      - name: 'Load Nexus credential'
+        id: load-credential
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/credential-load-action@45c3f024f4f8b2a6f8f24b623279d72f72104344  # v1.1.0
+        with:
+          # yamllint disable-line rule:line-length
+          op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          vault_mapping_json: ${{ secrets.VAULT_MAPPING_JSON }}
+          credential_grants_json: ${{ vars.CREDENTIAL_LOAD_GRANTS }}
+          export_env: 'false'
+
+      - name: 'Publish package to Nexus'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/node-publish-action@edbfa68ff0f9a87924ce4382053398188d1fc335  # v0.0.1
+        with:
+          # yamllint disable-line rule:line-length
+          publish_version: ${{ steps.publish-params.outputs.publish_version }}
+          registry_url: ${{ inputs.registry_url }}
+          path_prefix: ${{ inputs.path_prefix }}
+          node_version: ${{ needs.node-metadata.outputs.node_version }}
+          tag: ${{ inputs.npm_tag }}
+          access: ${{ inputs.npm_access }}
+          dry_run: ${{ inputs.dry_run }}
+          # Nexus npm repositories lack provenance/attestation support
+          provenance: 'false'
+          load_credential: 'false'
+          nexus_user: ${{ steps.publish-params.outputs.nexus_user }}
+          nexus_password: ${{ steps.load-credential.outputs.credential }}
