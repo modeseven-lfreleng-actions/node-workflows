@@ -1580,11 +1580,13 @@ jobs:
       # credential_grants_json wires the admin-managed
       # CREDENTIAL_LOAD_GRANTS repository/organisation variable in at
       # the workflow layer: composite actions cannot read vars, and the
-      # grants list must never become a caller-facing input
+      # grants list must never become a caller-facing input.
+      # credential-load-action v2+ performs no checkout by default,
+      # so the downloaded artefact tree survives this step intact
       - name: 'Load Nexus credential'
         id: load-credential
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/credential-load-action@45c3f024f4f8b2a6f8f24b623279d72f72104344  # v1.1.0
+        uses: lfreleng-actions/credential-load-action@69d76d75b1f52779dfdfe4ec788b5dbb3face234  # v2.0.0
         with:
           # yamllint disable-line rule:line-length
           op_service_account_token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
