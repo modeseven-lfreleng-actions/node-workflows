@@ -104,13 +104,20 @@ release file and `version.properties` fails the release publish.
 | `node_version`            | string  | `''`       | Node.js version; empty auto-detects `engines.node`, then 22       |
 | `build_tool`              | string  | `''`       | `npm` or `yarn`; empty auto-detects from project metadata         |
 | `build_scripts`           | string  | `'build'`  | package.json script(s) the build job runs                         |
-| `test_script`             | string  | `'test'`   | package.json script the tests job runs                            |
+| `tests_enabled`           | boolean | `true`     | Run the tests job (set false to skip tests)                       |
+| `test_script`             | string  | `'test'`   | package.json test script(s); comma/space/newline separated list   |
 | `test_permit_fail`        | boolean | `false`    | Permit test failures without failing the workflow                 |
+| `test_artifact_path`      | string  | `''`       | Test output/report path uploaded as an artefact; empty disables   |
+| `audit_enabled`           | boolean | `true`     | Run the dependency audit job (set false to skip)                  |
 | `audit_level`             | string  | `'high'`   | npm audit severity threshold that fails the audit                 |
 | `production_only`         | boolean | `false`    | Restrict the audit to production dependencies                     |
 | `audit_permit_fail`       | boolean | `false`    | Permit dependency audit failures (the NO_BLOCK pattern)           |
+| `sbom_enabled`            | boolean | `true`     | Generate an SBOM (set false to skip SBOM and Grype jobs)          |
 | `grype_fail_on`           | string  | `'medium'` | Severity threshold that fails the Grype scan                      |
 | `grype_permit_fail`       | boolean | `false`    | Permit Grype findings without failing the job                     |
+| `build_timeout_minutes`   | number  | `15`       | Timeout (minutes) for the build job                               |
+| `test_timeout_minutes`    | number  | `10`       | Timeout (minutes) for the tests job                               |
+| `audit_timeout_minutes`   | number  | `10`       | Timeout (minutes) for the audit, SBOM and Grype jobs              |
 | `harden_runner_egress`    | string  | `'block'`  | Harden-runner egress policy: `block` or `audit`                   |
 | `harden_runner_allowlist` | string  | (pinned)   | Out-of-band harden-runner allow-list configuration                |
 | `gerrit_refspec`          | string  | `''`       | Gerrit refspec of the change under test                           |
@@ -124,7 +131,8 @@ The workflow takes no secrets and exposes no outputs.
 
 ### build-test-release.yaml
 
-All `build-test.yaml` inputs above, plus:
+All `build-test.yaml` inputs above (with `build_timeout_minutes` and
+`test_timeout_minutes` both defaulting to `12`), plus:
 
 <!-- markdownlint-disable MD013 -->
 
