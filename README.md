@@ -81,14 +81,15 @@ named in `registry_url`, using the credential contract below.
 ### Model B: merge-driven (`merge.yaml`)
 
 The Jenkins-heritage LF/Gerrit flow, as used across ONAP and similar
-projects. Every merge publishes a snapshot: the workflow reads
-`version.properties` (either `major=`/`minor=`/`patch=` keys or a
-combined `release_version=X.Y.Z` key) and publishes
-`X.Y.Z-SNAPSHOT` to `snapshot_registry_url`. When the merged commit
-adds a file under `releases/` whose `version:` matches
-`version.properties`, the workflow also publishes the plain `X.Y.Z`
-release to `release_registry_url`. A version mismatch between the
-release file and `version.properties` fails the release publish.
+projects. Every merge publishes a snapshot: the `build-metadata-action`
+parses `version.properties` (`major=`/`minor=`/`patch=` keys, a
+combined `release_version=X.Y.Z` key, or a `version=X.Y.Z` key,
+skipping Jenkins-era `${...}` interpolated values) and the
+workflow publishes `X.Y.Z-SNAPSHOT` to `snapshot_registry_url`. When
+the merged commit adds a file under `releases/` whose `version:`
+matches `version.properties`, the workflow also publishes the plain
+`X.Y.Z` release to `release_registry_url`. A version mismatch between
+the release file and `version.properties` fails the release publish.
 
 ## Inputs and Secrets
 

@@ -413,8 +413,9 @@ jobs:
     needs: gerrit-validate
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.resolve.outputs.version }}
-      snapshot_version: ${{ steps.resolve.outputs.snapshot_version }}
+      # yamllint disable-line rule:line-length
+      version: ${{ steps.build-metadata.outputs.version_properties_version }}
+      snapshot_version: ${{ steps.build-metadata.outputs.snapshot_version }}
     permissions:
       contents: read
     timeout-minutes: 5
@@ -460,57 +461,39 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      # TEMPLATE: The version.properties pattern below is the common
-      # Jenkins-heritage version source. Replace or extend it when your
-      # projects derive versions differently (package.json, go.mod tags,
-      # explicit inputs). Never `source` version.properties — parse it
-      # instead, so a hostile file cannot execute in the job.
-      - name: 'Resolve version from version.properties'
-        id: resolve
-        shell: bash
+      # version.properties (the Jenkins/global-jjb heritage version
+      # source) remains mandatory for the merge workflow. The
+      # build-metadata-action parses it (never sourcing it, and
+      # skipping Jenkins-era ${...} interpolated values) and
+      # synthesizes the X.Y.Z-SNAPSHOT interim version, so no
+      # version extraction logic lives in workflow shell code.
+      - name: 'Gather version metadata'
+        id: build-metadata
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-metadata-action@441d941775995fa0d562ee80b4cc6ed1230248ec  # v0.6.0
+        with:
+          path_prefix: ${{ inputs.path_prefix }}
+          artifact_upload: 'false'
+
+      - name: 'Require version.properties version'
         env:
-          PATH_PREFIX: ${{ inputs.path_prefix }}
+          # yamllint disable-line rule:line-length
+          PROPS_VERSION: ${{ steps.build-metadata.outputs.version_properties_version }}
+        shell: bash
         run: |
-          # Parse version.properties (major/minor/patch keys, or a
-          # combined release_version=X.Y.Z key) into snapshot and
-          # release versions
-          cd "${PATH_PREFIX}"
-          if [ ! -f version.properties ]; then
-            echo "::error::No version.properties file found; the" \
-              "merge workflow requires one to resolve the version"
+          # Fail fast unless version.properties supplied a full X.Y.Z
+          # numeric version: the merge workflow requires one, and the
+          # guard keeps malformed content out of downstream jobs
+          if [ -z "${PROPS_VERSION}" ]; then
+            echo "::error::No version resolved from" \
+              "version.properties; the merge workflow requires one"
             exit 1
           fi
-          # Each key is optional at this point (release_version OR the
-          # major/minor/patch trio), so tolerate grep finding nothing:
-          # under 'bash -e -o pipefail' a bare failing grep would
-          # otherwise abort the step
-          release_version=$({ grep -E '^release_version=' \
-            version.properties || true; } | head -n1 \
-            | sed 's/^release_version=//' | tr -d '[:space:]\r')
-          if [ -n "${release_version}" ]; then
-            version="${release_version}"
-          else
-            major=$({ grep -E '^major=' version.properties \
-              || true; } | head -n1 \
-              | sed 's/^major=//' | tr -d '[:space:]\r')
-            minor=$({ grep -E '^minor=' version.properties \
-              || true; } | head -n1 \
-              | sed 's/^minor=//' | tr -d '[:space:]\r')
-            patch=$({ grep -E '^patch=' version.properties \
-              || true; } | head -n1 \
-              | sed 's/^patch=//' | tr -d '[:space:]\r')
-            version="${major}.${minor}.${patch}"
-          fi
-          # Guard against malformed/hostile content before the value
-          # reaches $GITHUB_OUTPUT and downstream jobs; require a full
-          # X.Y.Z numeric shape (rejects 1..3, .2.3, 1.2., etc.)
-          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version resolved: ${version}"
+          if [[ ! "${PROPS_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version resolved: ${PROPS_VERSION}"
             exit 1
           fi
-          echo "Resolved version: ${version}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "snapshot_version=${version}-SNAPSHOT" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${PROPS_VERSION}"
 
   build:
     name: 'Build'
